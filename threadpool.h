@@ -15,25 +15,9 @@
 
 class ThreadPool {
 
-    struct Task {
-        virtual ~Task() {};
-        virtual void operator()() = 0;
-    };
-
-    template <typename T>
-    struct TaskImpl : Task {
-        std::packaged_task<T()> task;
-
-        TaskImpl(std::function<T()>&& func) : task(func) {}
-        ~TaskImpl() override {}
-
-        void operator()() override { task(); }
-        std::future<T> get_future() { return task.get_future(); }
-    };
-
 private:
     Mutex cs_work_queue;
-    std::queue<std::unique_ptr<Task>> m_work_queue GUARDED_BY(cs_work_queue);
+    std::queue<std::function<void()>> m_work_queue GUARDED_BY(cs_work_queue);
     std::condition_variable m_condition;
     // Stop indicator
     std::atomic<bool> m_stop{false};
@@ -78,14 +62,17 @@ public:
         m_stop = false;
     }
 
-    template <typename Callable, typename T = typename std::invoke_result<Callable>::type>
-    std::future<T> Submit(const Callable&& func) EXCLUSIVE_LOCKS_REQUIRED(!cs_work_queue)
+    template<class T>
+    auto Submit(T task) -> std::future<decltype(task())>
     {
-        std::unique_ptr<Task> task = std::make_unique<TaskImpl<T>>(func);
-        std::future<T> future = dynamic_cast<TaskImpl<T>*>(task.get())->get_future();
-
-        LOCK(cs_work_queue);
-        m_work_queue.push(std::move(task));
+        auto ptr_task = std::make_shared<std::packaged_task<decltype(task()) ()>>(std::move(task));
+        std::future<decltype(task())> future = ptr_task->get_future();
+        {
+            LOCK(cs_work_queue);
+            m_work_queue.emplace([=]() {
+                (*ptr_task)();
+            });
+        }
         m_condition.notify_one();
         return future;
     }
@@ -97,7 +84,7 @@ public:
 
     void ProcessTask() EXCLUSIVE_LOCKS_REQUIRED(!cs_work_queue)
     {
-        std::unique_ptr<Task> task;
+        std::function<void()> task;
         {
             // Wait for the task or until the stop flag is set
             WAIT_LOCK(cs_work_queue, wait_lock);
@@ -114,7 +101,7 @@ public:
         }
 
         // Execute the task
-        (*task)();
+        task();
     }
 };
 
